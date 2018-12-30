@@ -1,3 +1,4 @@
 .
 .idea/*
 out/production/*
+datasets/nytimes_libsvm_block0.txt
