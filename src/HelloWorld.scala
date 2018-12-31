@@ -8,14 +8,14 @@ import org.apache.commons.math3.util.FastMath
 object HelloWorld extends App {
   println("hello whold!")
   //hyper parameters
-  val k = 200
+  val k = 50
   val vocabSize = 102660
   val corpusSize = 800
   val eta = 1.0 / k
   val workersize = 8
   val iter = 1
-  val weight = math.pow((1024 + iter) * workersize, -0.9)
-  val maxRecursive = 2.0
+  val weight = math.pow((4096 + iter) * workersize, -0.99)
+  val maxRecursive = 9.0
   val a1 = 1.0 - weight
   val a2 = weight * corpusSize
   val a3 = weight * eta
@@ -33,35 +33,33 @@ object HelloWorld extends App {
   var a1factorial = 1.0
   var a1factsum = 0.0
   // Step 1 : Get Datasets
-  val docs = generateDocs()
-//  // Step 2 : Training Model
-//  var startTime = System.nanoTime()
-//  val finalResult = SingleThread(index, docs)
-//  println("Training Time: " + (1.0 * (System.nanoTime()-startTime) / 1e9).toString)
-//  // Step 3 : Test Model
-//  startTime = System.nanoTime()
-//  val perplexity = Perplexity(docs, finalResult, tokenCount)
-//  println("perplexity: " + perplexity.toString)
-//  println("Testing Time: " + (1.0 * (System.nanoTime()-startTime) / 1e9).toString)
+  val fileName = "datasets/nytimes_libsvm_75k.txt"
+  val docs = generateDocs(fileName)
+  // Step 2 : Training Model
+  println(sum(LambdaQ(::, 1)))
+  var startTime = System.nanoTime()
+  val finalResult = SingleThread(index, docs)
+  println("Training Time: " + (1.0 * (System.nanoTime()-startTime) / 1e9).toString)
+  println(sum(finalResult(::, 1)))
+  // Step 3 : Test Model
+  startTime = System.nanoTime()
+  val perplexity = Perplexity(finalResult.t)
+  println("perplexity: " + perplexity.toString)
+  println("Testing Time: " + (1.0 * (System.nanoTime()-startTime) / 1e9).toString)
 
-  def generateDocs(): Iterator[(Long, List[(Int, Double)])]= {
+  def generateDocs(fileName: String): Iterator[(Long, List[(Int, Double)])]= {
     // val fileName = "datasets/nytimes_libsvm_800.txt"
-    var tokenC: Double = 0.0
-    val fileName = "datasets/documents.txt"
+
     val lines = scala.io.Source.fromFile(fileName).getLines
     val documents = lines.map{ line =>
-      println("line:" + line)
       val parts = line.split(" ")
       val docId = parts.apply(0).toLong
       val termCounts = parts.filter(part => part.contains(":")).map{ part =>
         val pair = part.split(":")
         val id = Integer.parseInt(pair.apply(0))
         val ct = Integer.parseInt(pair.apply(1)).toDouble
-        print("\tid: " + id.toString)
-        print("\tct: " + ct.toString)
         (id, ct)
       }
-      println("docId: " + docId)
       (docId, termCounts.toList)
     }
     documents
@@ -82,6 +80,7 @@ object HelloWorld extends App {
       }
       val ids = idsA.toList
       val tmp1 = a3 * a1factsum
+
       // YY matrix read to get PartLambda  --- 2.5 ms
       // YY Todo: Multi Thread
       val PartQ = LambdaQ(::, ids).toDenseMatrix //  k * ids
@@ -124,9 +123,12 @@ object HelloWorld extends App {
     LambdaQ
   }
 
-  def Perplexity(docs: Iterator[(Long, List[(Int, Double)])], lambda: BDM[Double], tokenCount: Double): Double = {
-    val Elogbeta = dirichletExpectation(lambda.t).t
-    val expElogbeta = exp(Elogbeta)
+  def Perplexity(lambdaD: BDM[Double]): Double = {
+    val fileName1 = "datasets/nytimes_libsvm_800.txt"
+    val docs = generateDocs(fileName1)
+    val ElogbetaD = dirichletExpectation(lambdaD.t).t
+    val expElogbetaD = exp(ElogbetaD)
+    var tokenCount: Double = 0.0
 
     val corpusPart = docs.map { case (id: Long, termCounts: List[(Int, Double)]) =>
       val len = termCounts.length
@@ -136,16 +138,17 @@ object HelloWorld extends App {
       while(i < len){
         idsA.update(i, termCounts.apply(i)._1)
         cts.update(i, termCounts.apply(i)._2)
+        tokenCount += cts.apply(i)
         i += 1
       }
       val ids = idsA.toList
       var docBound = 0.0D
       val (gammad: BDV[Double], _, _) = lowPrecisionVI(
-        ids, cts, expElogbeta, alpha, gammaShape, k, maxRecursive, seed + id)
+        ids, cts, expElogbetaD, alpha, gammaShape, k, maxRecursive, seed + id)
       val Elogthetad: BDV[Double] = dirExpLowPrecision(gammad, maxRecursive)
       // E[log p(doc | theta, beta)]
       termCounts.foreach { case (idx, count) =>
-        val tmp = Elogthetad + Elogbeta(idx, ::).t
+        val tmp = Elogthetad + ElogbetaD(idx, ::).t
         val tmp2 = logSumExp(tmp)
         docBound += count * tmp2
       }
@@ -155,12 +158,14 @@ object HelloWorld extends App {
       docBound += lgamma(sum(alpha)) - lgamma(sum(gammad))
       docBound
     }.sum
+    println("corpusPart: " + corpusPart)
 
     val sumEta = eta * vocabSize
-    val topicsPart = sum((eta - lambda) *:* Elogbeta) +
-      sum(lgamma(lambda) - lgamma(eta)) +
-      sum(lgamma(sumEta) - lgamma(sum(lambda(::, breeze.linalg.*))))
-
+    val topicsPart = sum((eta - lambdaD) *:* ElogbetaD) +
+      sum(lgamma(lambdaD) - lgamma(eta)) +
+      sum(lgamma(sumEta) - lgamma(sum(lambdaD(::, breeze.linalg.*))))
+    println("topicsPart: " + topicsPart)
+    println("tokenCount: " + tokenCount)
     val bound = topicsPart + corpusPart
     exp(-bound / tokenCount)
   }
