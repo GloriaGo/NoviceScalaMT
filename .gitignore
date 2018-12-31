@@ -2,3 +2,6 @@
 .idea/*
 out/production/*
 datasets/nytimes_libsvm_block0.txt
+datasets/nytimes_libsvm_75k.txt
+datasets/nytimes_libsvm_8k.txt
+datasets/split_dataset.py
