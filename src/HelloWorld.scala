@@ -5,6 +5,12 @@ import breeze.numerics._
 import breeze.stats.distributions.{Gamma, RandBasis}
 import org.apache.commons.math3.util.FastMath
 
+import java.util.concurrent.Executors
+import scala.concurrent.{ExecutionContext, Await, Future}
+import scala.concurrent.duration._
+import scala.util.{Failure, Success}
+
+
 object HelloWorld extends App {
   println("hello whold!")
   //hyper parameters
@@ -33,12 +39,13 @@ object HelloWorld extends App {
   var a1factorial = 1.0
   var a1factsum = 0.0
   // Step 1 : Get Datasets
-  val fileName = "datasets/nytimes_libsvm_75k.txt"
+  val fileName = "/Users/sunxiaofei/workspace/ForMyLove/NoviceScalaMT/datasets/nytimes_libsvm_8k.txt"
   val docs = generateDocs(fileName)
   // Step 2 : Training Model
   println(sum(LambdaQ(::, 1)))
   var startTime = System.nanoTime()
   val finalResult = SingleThread(index, docs)
+//  val finalResult = MultiThread(index, docs, 4)
   println("Training Time: " + (1.0 * (System.nanoTime()-startTime) / 1e9).toString)
   println(sum(finalResult(::, 1)))
   // Step 3 : Test Model
@@ -123,8 +130,75 @@ object HelloWorld extends App {
     LambdaQ
   }
 
+  def MultiThread(index: Long, docs: Iterator[(Long, List[(Int, Double)])], numThreads: Int): BDM[Double] = {
+    // customize the execution context to use the specified number of threads
+    implicit val ec = ExecutionContext.fromExecutor(Executors.newFixedThreadPool(numThreads))
+
+    val tasks: Iterator[Future[Long]] = for ((docId: Long, termCounts: List[(Int, Double)]) <- docs) yield Future{
+        val len = termCounts.length
+        // YY Sparse Words
+        val idsA = new Array[Int](len)
+        val cts = new Array[Double](len)
+        var i: Int = 0
+        while(i < len){
+          idsA.update(i, termCounts.apply(i)._1)
+          cts.update(i, termCounts.apply(i)._2)
+          i += 1
+        }
+        val ids = idsA.toList
+        val tmp1 = a3 * a1factsum
+
+        // YY matrix read to get PartLambda  --- 2.5 ms
+        // YY Todo: Multi Thread
+        val PartQ = LambdaQ(::, ids).toDenseMatrix //  k * ids
+        val PartLambda: BDM[Double] = PartQ * a1factorial + tmp1 // k * ids
+
+        // YY get RowSum --- 0.0025 ms
+        val tmp2 = tmp1 * vocabSize
+        val rowSum = rowSumQ * a1factorial + tmp2 // k
+
+        // YY Todo: Multi Thread
+        val PartExpElogBetaD = exp(dirExpLowPrecision(PartLambda,
+          rowSum, maxRecursive)).t.toDenseMatrix // ids * k
+
+        // E-Step
+        // YY Local VI with sparse expElogbeta, sstats(k * ids) --- 5.3 ms
+        // YY Todo: Multi Thread
+        val (gammad, sstats) = partLowPVI(PartExpElogBetaD, alpha, gammaShape, k,
+          maxRecursive, seed + index, iter, ids, cts)
+
+        // YY real delta -> lazy update delta  --- 0.37 ms
+        val tmp3 = a2 / (a1factorial * a1)
+        // YY Todo: Multi Thread
+        val DeltaLambdaQ = (sstats * tmp3) *:* PartExpElogBetaD.t // k * ids
+        // YY prepare for next lambdaQ --- 1.65 ms
+        PartQ := PartQ + DeltaLambdaQ // k * ids
+        LambdaQ(::, ids) := PartQ // Sparse Write
+
+        // YY prepare for next sumQ --- 0.13 ms
+        // YY Todo: Multi Thread
+        val deltaRowSum = sum(DeltaLambdaQ(breeze.linalg.*, ::)) // k * ids
+        rowSumQ := rowSumQ + deltaRowSum
+
+        // YY prepare for next lazy update
+        a1factsum = a1factsum + a1factorial
+        a1factorial = a1factorial * a1
+        docId
+    }
+
+    val aggregated: Future[Iterator[Long]] = Future.sequence(tasks)
+
+    val squares: Iterator[Long] = Await.result(aggregated, 20.seconds)
+    println("Squares: " + squares)
+
+    // YY reconstract real Matrix value --- 246 ms
+    val tmp4 = a3 * a1factsum
+    LambdaQ := LambdaQ * a1factorial + tmp4 // k * v
+    LambdaQ
+  }
+
   def Perplexity(lambdaD: BDM[Double]): Double = {
-    val fileName1 = "datasets/nytimes_libsvm_800.txt"
+    val fileName1 = "/Users/sunxiaofei/workspace/ForMyLove/NoviceScalaMT/datasets/nytimes_libsvm_8k.txt"
     val docs = generateDocs(fileName1)
     val ElogbetaD = dirichletExpectation(lambdaD.t).t
     val expElogbetaD = exp(ElogbetaD)
