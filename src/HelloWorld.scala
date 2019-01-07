@@ -1,60 +1,111 @@
 import java.util.Random
+import java.util.concurrent.Executors
 
 import breeze.linalg.{max, sum, DenseMatrix => BDM, DenseVector => BDV}
 import breeze.numerics._
 import breeze.stats.distributions.{Gamma, RandBasis}
 import org.apache.commons.math3.util.FastMath
 
+import java.util.concurrent.Executors
+import scala.concurrent.{ExecutionContext, Await, Future}
+import scala.concurrent.duration._
+import scala.util.{Failure, Success}
+
+
 object HelloWorld extends App {
   println("hello whold!")
   //hyper parameters
-  val k = 50
+  val k = 20
   val vocabSize = 102660
   val corpusSize = 800
   val eta = 1.0 / k
-  val workersize = 8
-  val iter = 1
-  val weight = math.pow((4096 + iter) * workersize, -0.99)
+  val workersize = 1
   val maxRecursive = 9.0
-  val a1 = 1.0 - weight
-  val a2 = weight * corpusSize
-  val a3 = weight * eta
   val seed = 0L
   val randomGenerator = new Random(seed)
   val alpha = BDV.fill[Double](k, 1.0 / k)
   val gammaShape = 100
-
-  val lambdaBc = getGammaMatrix(k, vocabSize) //  k * v, 1.5 s
+  val lambdaInit = getGammaMatrix(k, vocabSize) //  k * v, 1.5 s
   val index = 1L
 
-  val LambdaQ = lambdaBc // k * v
-  var nonEmptyDocCount: Long = 0L
-  var rowSumQ: BDV[Double] = sum(LambdaQ(breeze.linalg.*, ::)) // 1 * k <- k * v
-  var a1factorial = 1.0
-  var a1factsum = 0.0
-  // Step 1 : Get Datasets
-  val fileName = "datasets/nytimes_libsvm_75k.txt"
-  val docs = generateDocs(fileName)
-  // Step 2 : Training Model
-  println(sum(LambdaQ(::, 1)))
-  var startTime = System.nanoTime()
-  val finalResult = SingleThread(index, docs)
-  println("Training Time: " + (1.0 * (System.nanoTime()-startTime) / 1e9).toString)
-  println(sum(finalResult(::, 1)))
-  // Step 3 : Test Model
-  startTime = System.nanoTime()
-  val perplexity = Perplexity(finalResult.t)
-  println("perplexity: " + perplexity.toString)
-  println("Testing Time: " + (1.0 * (System.nanoTime()-startTime) / 1e9).toString)
+  val i_2 = {1 to 10}.map{ case i=>
+    println("i=", i)
+    testMatrixRead()
+    i*i
+  }
 
-  def generateDocs(fileName: String): Iterator[(Long, List[(Int, Double)])]= {
+
+
+
+//  // Step 1 : Get Datasets
+//  val fileName = "datasets/nytimes_libsvm_800.txt"
+//  val docs = generateDocs(fileName)
+//  // Step 2 : Training Model
+//  var startTime = System.nanoTime()
+//  val finalResult = SingleThread(index, docs)
+//  println("Training Time: " + (1.0 * (System.nanoTime() - startTime) / 1e9).toString)
+//  println("finalResult1: " + sum(finalResult(1, ::)))
+//
+//  //  startTime = System.nanoTime()
+//  //  val finalResult2 = MultiThread(index, docs, 4)
+//  //  println("Training Time 2: " + (1.0 * (System.nanoTime()-startTime) / 1e9).toString)
+//  //  println("finalResult2:" + sum(finalResult2(::, 1)))
+//
+//  // Step 3 : Test Model
+//  startTime = System.nanoTime()
+//  val perplexity = Perplexity(finalResult.t)
+//  println("perplexity: " + perplexity.toString)
+//  println("Testing Time: " + (1.0 * (System.nanoTime() - startTime) / 1e9).toString)
+
+
+  def testMatrixRead(): Unit ={
+    var LambdaQ: BDM[Double] = lambdaInit // k * v
+    val tmp_docs: List[Int] = {0 to 1000}.toList
+    val group1 = tmp_docs.grouped(1000).toList
+    val group2 = tmp_docs.grouped(1).toList
+
+
+
+    val startTime2 = System.nanoTime()
+    val result2 = group2.map { case ids: List[Int] =>
+      // Step 1 : read shared parameters
+      val PartQ = LambdaQ(::, ids).toDenseMatrix
+      1
+    }
+    println(result2.size)
+    println("Testing2 Time: " + (1.0 * (System.nanoTime() - startTime2) / 1e6).toString)
+
+
+    val startTime1 = System.nanoTime()
+    val result1 = group1.map { case ids: List[Int] =>
+      // Step 1 : read shared parameters
+      val PartQ = LambdaQ(::, ids).toDenseMatrix
+      1
+    }
+    println(result1.size)
+    println("Testing1 Time: " + (1.0 * (System.nanoTime() - startTime1) / 1e6).toString)
+
+
+    val startTime3 = System.nanoTime()
+    val result3 = group2.map { case ids: List[Int] =>
+      // Step 1 : read shared parameters
+      val PartQ = LambdaQ(::, ids).toDenseMatrix
+      1
+    }
+    println(result3.size)
+    println("Testing2 Time: " + (1.0 * (System.nanoTime() - startTime3) / 1e6).toString)
+
+
+  }
+
+  def generateDocs(fileName: String): Iterator[(Long, List[(Int, Double)])] = {
     // val fileName = "datasets/nytimes_libsvm_800.txt"
 
     val lines = scala.io.Source.fromFile(fileName).getLines
-    val documents = lines.map{ line =>
+    val documents = lines.map { line =>
       val parts = line.split(" ")
       val docId = parts.apply(0).toLong
-      val termCounts = parts.filter(part => part.contains(":")).map{ part =>
+      val termCounts = parts.filter(part => part.contains(":")).map { part =>
         val pair = part.split(":")
         val id = Integer.parseInt(pair.apply(0))
         val ct = Integer.parseInt(pair.apply(1)).toDouble
@@ -65,9 +116,166 @@ object HelloWorld extends App {
     documents
   }
 
+  def initDoc(termCounts: List[(Int, Double)]): (List[Int], Array[Double]) = {
+    val len = termCounts.length
+    val idsA = new Array[Int](len)
+    val cts = new Array[Double](len)
+    var i: Int = 0
+    while (i < len) {
+      idsA.update(i, termCounts.apply(i)._1)
+      cts.update(i, termCounts.apply(i)._2)
+      i += 1
+    }
+    val ids = idsA.toList
+    (ids, cts)
+  }
+
+  def calculateDelta(PartQ: BDM[Double], rowSum: BDV[Double], a1factorial: Double, a1factsum: Double,
+                     ids: List[Int], cts: Array[Double], iter: Int,
+                     a1: Double, a2: Double, a3: Double): (BDV[Double], BDM[Double]) = {
+    val PartLambda: BDM[Double] = PartQ * a1factorial + a3 * a1factsum // k * ids
+    val PartExpElogBetaD = exp(dirExpLowPrecision(PartLambda,
+      rowSum, maxRecursive)).t.toDenseMatrix // ids * k
+    val (gammad, sstats) = partLowPVI(PartExpElogBetaD, alpha, gammaShape, k,
+      maxRecursive, seed + index, iter, ids, cts)
+    val tmp3 = a2 / (a1factorial * a1)
+    val deltaLambdaQ = (sstats * tmp3) *:* PartExpElogBetaD.t // k * ids
+    val deltaRowSum = sum(deltaLambdaQ(breeze.linalg.*, ::)) // k * ids
+    (deltaRowSum, deltaLambdaQ)
+  }
+
   def SingleThread(index: Long, docs: Iterator[(Long, List[(Int, Double)])]): BDM[Double] = {
+    val iter = 1
+    val weight = math.pow((4096 + iter) * workersize, -0.6)
+    val a1 = 1.0 - weight
+    val a2 = weight * corpusSize
+    val a3 = weight * eta
+
+    var a1factorial = 1.0
+    var a1factsum = 0.0
+    var LambdaQ: BDM[Double] = lambdaInit // k * v
+    var rowSumQ: BDV[Double] = sum(LambdaQ(breeze.linalg.*, ::)) // 1 * k <- k * v
+    println("rowSumQ length:" + rowSumQ.length)
+    println(sum(LambdaQ(1, ::)))
+
+    val threadNumber = 4
+
+    val groupedIt = docs.grouped(threadNumber)
+    while (groupedIt.hasNext) {
+      val idsSeq = scala.collection.mutable.ArrayBuffer.empty[(List[Int], Array[Double])]
+      groupedIt.next.foreach { case (docId: Long, termCounts: List[(Int, Double)]) =>
+        // Step 0 : parse document
+        val (ids, cts) = initDoc(termCounts)
+
+//        idsSeq += (ids, cts)
+      }
+      val deltaSeq = idsSeq.map{ case (ids: List[Int], cts: Array[Double]) =>
+        // Step 1 : read shared parameters
+        val rowSum = rowSumQ * a1factorial + a3 * a1factsum * vocabSize // k
+        val PartQ = LambdaQ(::, ids).toDenseMatrix //  k * ids
+
+        // Step 2 : calculate delta
+        val (deltaRowSum, deltaLambdaQ) = calculateDelta(PartQ, rowSum, a1factorial, a1factsum,
+          ids, cts, iter, a1, a2, a3)
+        (ids, deltaLambdaQ, deltaRowSum)
+      }
+      // Step 3 : write shared parameters
+      deltaSeq.foreach { case (ids, deltaLambdaQ, deltaRowSum) =>
+        LambdaQ(::, ids) := LambdaQ(::, ids) + deltaLambdaQ // Sparse Write
+        rowSumQ := rowSumQ + deltaRowSum
+        a1factsum = a1factsum + a1factorial
+        a1factorial = a1factorial * a1
+      }
+    }
+    // YY reconstract real Matrix value --- 246 ms
+    val tmp4 = a3 * a1factsum
+    LambdaQ := LambdaQ * a1factorial + tmp4 // k * v
+    LambdaQ
+  }
+
+  def MultiThread(index: Long, docs: Iterator[(Long, List[(Int, Double)])], numThreads: Int): BDM[Double] = {
+    // customize the execution context to use the specified number of threads
+    //    println(Runtime.getRuntime.availableProcessors())
+    //    implicit val ec = ExecutionContext.fromExecutor(Executors.newFixedThreadPool(numThreads))
+    //    val tasks: Iterator[Future[Long]] = for ((docId: Long, termCounts: List[(Int, Double)]) <- docs) yield Future{
+    val iter = 1
+    val weight = math.pow((4096 + iter) * workersize, -0.6)
+    val a1 = 1.0 - weight
+    val a2 = weight * corpusSize
+    val a3 = weight * eta
+    var a1factorial = 1.0
+    var a1factsum = 0.0
+    val LambdaP: BDM[Double] = lambdaInit
+    var rowSumP: BDV[Double] = sum(LambdaP(breeze.linalg.*, ::)) // 1 * k <- k * v
+
     docs.foreach { case (docId: Long, termCounts: List[(Int, Double)]) =>
-      nonEmptyDocCount += 1
+      val len = termCounts.length
+      // YY Sparse Words
+      val idsA = new Array[Int](len)
+      val cts = new Array[Double](len)
+      var i: Int = 0
+      while (i < len) {
+        idsA.update(i, termCounts.apply(i)._1)
+        cts.update(i, termCounts.apply(i)._2)
+        i += 1
+      }
+      val ids = idsA.toList
+      val tmp1 = a3 * a1factsum
+
+      // YY matrix read to get PartLambda  --- 2.5 ms
+      // YY Todo: Multi Thread
+      val PartP = LambdaP(::, ids).toDenseMatrix //  k * ids
+    val PartLambda: BDM[Double] = PartP * a1factorial + tmp1 // k * ids
+
+      // YY get RowSum --- 0.0025 ms
+      val tmp2 = tmp1 * vocabSize
+      val rowSum = rowSumP * a1factorial + tmp2 // k
+
+      // YY Todo: Multi Thread
+      val PartExpElogBetaD = exp(dirExpLowPrecision(PartLambda,
+        rowSum, maxRecursive)).t.toDenseMatrix // ids * k
+
+      // E-Step
+      // YY Local VI with sparse expElogbeta, sstats(k * ids) --- 5.3 ms
+      // YY Todo: Multi Thread
+      val (gammad, sstats) = partLowPVI(PartExpElogBetaD, alpha, gammaShape, k,
+        maxRecursive, seed + index, iter, ids, cts)
+
+      // YY real delta -> lazy update delta  --- 0.37 ms
+      val tmp3 = a2 / (a1factorial * a1)
+      // YY Todo: Multi Thread
+      val DeltaLambdaP = (sstats * tmp3) *:* PartExpElogBetaD.t // k * ids
+      // YY prepare for next lambdaQ --- 1.65 ms
+      PartP := PartP + DeltaLambdaP // k * ids
+      LambdaP(::, ids) := PartP // Sparse Write
+
+      // YY prepare for next sumQ --- 0.13 ms
+      // YY Todo: Multi Thread
+      val deltaRowSum = sum(DeltaLambdaP(breeze.linalg.*, ::)) // k * ids
+      rowSumP := rowSumP + deltaRowSum
+
+      // YY prepare for next lazy update
+      a1factsum = a1factsum + a1factorial
+      a1factorial = a1factorial * a1
+      docId
+    }
+
+    //    val aggregated: Future[Iterator[Long]] = Future.sequence(tasks)
+    //
+    //    val squares: Iterator[Long] = Await.result(aggregated, 20.seconds)
+    //    println("Squares: " + squares)
+
+    // YY reconstract real Matrix value --- 246 ms
+    val tmp4 = a3 * a1factsum
+    LambdaP := LambdaP * a1factorial + tmp4 // k * v
+    LambdaP
+  }
+
+  def FeiFeiMultiThread(index: Long, docs: Iterator[(Long, List[(Int, Double)])], numThreads: Int): BDM[Double] = {
+    // customize the execution context to use the specified number of threads
+    implicit val ec = ExecutionContext.fromExecutor(Executors.newFixedThreadPool(numThreads))
+
+    val tasks: Iterator[Future[Long]] = for ((docId: Long, termCounts: List[(Int, Double)]) <- docs) yield Future{
       val len = termCounts.length
       // YY Sparse Words
       val idsA = new Array[Int](len)
@@ -116,7 +324,14 @@ object HelloWorld extends App {
       // YY prepare for next lazy update
       a1factsum = a1factsum + a1factorial
       a1factorial = a1factorial * a1
+      docId
     }
+
+    val aggregated: Future[Iterator[Long]] = Future.sequence(tasks)
+
+    val squares: Iterator[Long] = Await.result(aggregated, 20.seconds)
+    println("Squares: " + squares)
+
     // YY reconstract real Matrix value --- 246 ms
     val tmp4 = a3 * a1factsum
     LambdaQ := LambdaQ * a1factorial + tmp4 // k * v
@@ -135,7 +350,7 @@ object HelloWorld extends App {
       val idsA = new Array[Int](len)
       val cts = new Array[Double](len)
       var i: Int = 0
-      while(i < len){
+      while (i < len) {
         idsA.update(i, termCounts.apply(i)._1)
         cts.update(i, termCounts.apply(i)._2)
         tokenCount += cts.apply(i)
@@ -177,20 +392,24 @@ object HelloWorld extends App {
     val temp = gammaRandomGenerator.sample(row * col).toArray
     new BDM[Double](col, row, temp).t
   }
+
   def dirichletExpectation(alpha: BDM[Double]): BDM[Double] = {
     val rowSum = sum(alpha(breeze.linalg.*, ::))
     partDirExp(alpha, rowSum)
   }
+
   def partDirExp(newAlpha: BDM[Double], rowSum: BDV[Double]): BDM[Double] = {
     val digAlpha = digamma(newAlpha)
     val digRowSum = digamma(rowSum)
     val result = digAlpha(::, breeze.linalg.*) - digRowSum
     result // k * ids
   }
+
   def logSumExp(x: BDV[Double]): Double = {
     val a = max(x)
     a + log(sum(exp(x -:- a)))
   }
+
   def partLowPVI(expElogbetad: BDM[Double], alpha: breeze.linalg.Vector[Double], gammaShape: Double, k: Int,
                  maxRecursive: Double, seed: Long, iter: Int, ids: List[Int], cts: Array[Double]): (BDV[Double], BDM[Double]) = {
     // Initialize the variational distribution q(theta|gamma) for the mini-batch
@@ -219,20 +438,21 @@ object HelloWorld extends App {
     val sstatsd = expElogthetad.asDenseMatrix.t * (ctsVector /:/ phiNorm).asDenseMatrix
     (gammad, sstatsd)
   }
+
   def lowPrecisionVI(ids: List[Int], cts: Array[Double], expElogbeta: BDM[Double], alpha: breeze.linalg.Vector[Double],
-                      gammaShape: Double, k: Int, maxRecursive: Double, seed: Long): (BDV[Double], BDM[Double], List[Int]) = {
+                     gammaShape: Double, k: Int, maxRecursive: Double, seed: Long): (BDV[Double], BDM[Double], List[Int]) = {
     // Spark 2.4.0 Version
     // Initialize the variational distribution q(theta|gamma) for the mini-batch
     val randBasis = new RandBasis(new org.apache.commons.math3.random.MersenneTwister(seed))
     val gammad: BDV[Double] =
-      new Gamma(gammaShape, 1.0 / gammaShape)(randBasis).samplesVector(k)                   // K
+      new Gamma(gammaShape, 1.0 / gammaShape)(randBasis).samplesVector(k) // K
     // val expElogthetad: BDV[Double] = exp(LDAUtils.dirichletExpectation(gammad))  // K
     val expElogthetad: BDV[Double] = exp(dirExpLowPrecision(gammad, maxRecursive))
-    val expElogbetad = expElogbeta(ids, ::).toDenseMatrix                        // ids * K
+    val expElogbetad = expElogbeta(ids, ::).toDenseMatrix // ids * K
 
-    val phiNorm: BDV[Double] = expElogbetad * expElogthetad +:+ 1e-100            // ids
+    val phiNorm: BDV[Double] = expElogbetad * expElogthetad +:+ 1e-100 // ids
     var meanGammaChange = 1D
-    val ctsVector = new BDV[Double](cts)                                         // ids
+    val ctsVector = new BDV[Double](cts) // ids
 
     // Iterate between gamma and phi until convergence
     while (meanGammaChange > 1e-2) {
@@ -248,6 +468,7 @@ object HelloWorld extends App {
     val sstatsd = expElogthetad.asDenseMatrix.t * (ctsVector /:/ phiNorm).asDenseMatrix
     (gammad, sstatsd, ids)
   }
+
   def digammaLowPrecision(x: Double, maxRecursive: Double): Double = {
     var v = 0.0
     if (x > 0 && x <= 1e-5) { // use method 5 from Bernardo AS103
@@ -288,5 +509,3 @@ object HelloWorld extends App {
     result // k * v
   }
 }
-
-
