@@ -20,7 +20,7 @@ object MatrixReadWrite extends App {
   val index = 1L
 
 
-  val manyRounds = 5
+  val manyRounds = 30
   val step = 1
   val max = 10
   val min = 1
@@ -65,7 +65,81 @@ object MatrixReadWrite extends App {
     }
   }
 
-  testWriteTime()
+  testReadTime()
+
+  def testReadTime(): Unit = {
+    val timer = new Array[Long](2)
+    var x = 0.0
+    println("Start Timer ......")
+    var startTime = 0L
+    var endTime = 0L
+    for (a <- 1 to manyRounds) {
+      // Only to make sure JVM is big enough
+      val lambda = getGammaMatrixH(k, vocabSize)
+      val rowSum: BDV[Double] = sum(lambda(breeze.linalg.*, ::)) // 1 * k <- k * v
+      val linkpart = {
+        max to min by -step
+      }.map { case b =>
+        val randomIds = createRandomList(b * 100, vocabSize - 1)
+        val part = lambda(::, randomIds).toDenseMatrix
+        val partBeta: BDM[Double] = part * 0.1 + 2.0
+        val partSum: BDV[Double] = sum(partBeta(breeze.linalg.*, ::))
+        (part, partBeta, randomIds)
+      }
+      linkpart.foreach { case (part, partBeta, ids) =>
+        lambda(::, ids) := part + partBeta
+      }
+
+      // Start from here
+      val lambdaQ = getGammaMatrixV(k, vocabSize)
+      val rowSumQ: BDV[Double] = sum(lambdaQ(breeze.linalg.*, ::)) // 1 * k <- k * v
+      println("lambdaQ old rowSum : " + rowSumQ.apply(1))
+      for (b <- max to min by -step) {
+        val randomIds = createRandomList(b * 100, vocabSize - 1)
+        println("randomIds : " + randomIds.apply(1))
+
+        startTime = System.nanoTime()
+
+        val partQ = lambdaQ(::, randomIds).toDenseMatrix
+        println("partQ: " + partQ.apply(1, 2))
+
+        endTime = System.nanoTime()
+        timer.update(0, timer.apply(0) + endTime - startTime)
+
+        lambdaQ(::, randomIds) := partQ + partQ
+      }
+      println("lambdaQ new rowSum : " + sum(lambdaQ(breeze.linalg.*, ::)).apply(1))
+
+      val lambdaP = getGammaMatrixH(k, vocabSize)
+      val rowSumP: BDV[Double] = sum(lambdaP(breeze.linalg.*, ::)) // 1 * k <- k * v
+      println("lambdaP old rowSum : " + rowSumP.apply(1))
+      val linkIds = {
+        max to min by -step
+      }.map { case b =>
+        createRandomList(b * 100, vocabSize - 1)
+      }
+      println(linkIds.apply(1).length)
+
+      startTime = System.nanoTime()
+
+      val linkpartP = linkIds.map { case randomIds =>
+        val partP = lambdaP(::, randomIds).toDenseMatrix
+        println("partP: " + partP.apply(1, 2))
+        (partP, randomIds)
+      }
+
+      endTime = System.nanoTime()
+      timer.update(1, timer.apply(1) + endTime - startTime)
+
+      linkpartP.foreach { case (partP, ids) =>
+        lambdaP(::, ids) := partP + partP
+      }
+      println("lambdaP new rowSum : " + sum(lambdaP(breeze.linalg.*, ::)).apply(1))
+    }
+    for (a <- 0 until timer.length) {
+      println(a.toString + " needs " + (1.0 * timer.apply(a) / (1e6 * manyRounds)).toString + " (ms)")
+    }
+  }
 
   def testWriteTime(): Unit = {
     val timer = new Array[Long](2)
@@ -76,27 +150,29 @@ object MatrixReadWrite extends App {
     for (a <- 1 to manyRounds) {
       // Only to make sure JVM is big enough
       val lambda = getGammaMatrixH(k, vocabSize)
-      val rowSum : BDV[Double] = sum(lambda(breeze.linalg.*, ::)) // 1 * k <- k * v
-      val linkpart = {max to min by -step}.map { case b =>
+      val rowSum: BDV[Double] = sum(lambda(breeze.linalg.*, ::)) // 1 * k <- k * v
+      val linkpart = {
+        max to min by -step
+      }.map { case b =>
         val randomIds = createRandomList(b * 100, vocabSize - 1)
         val part = lambda(::, randomIds).toDenseMatrix
         val partBeta: BDM[Double] = part * 0.1 + 2.0
-        val partSum : BDV[Double] = sum(partBeta(breeze.linalg.*, ::))
+        val partSum: BDV[Double] = sum(partBeta(breeze.linalg.*, ::))
         (part, partBeta, randomIds)
       }
-      linkpart.foreach{ case (part, partBeta, ids) =>
+      linkpart.foreach { case (part, partBeta, ids) =>
         lambda(::, ids) := part + partBeta
       }
       // Start from here
       val lambdaQ = getGammaMatrixH(k, vocabSize)
-      val rowSumQ : BDV[Double] = sum(lambdaQ(breeze.linalg.*, ::)) // 1 * k <- k * v
+      val rowSumQ: BDV[Double] = sum(lambdaQ(breeze.linalg.*, ::)) // 1 * k <- k * v
       println("lambdaQ old rowSum : " + rowSumQ.apply(1))
 
       for (b <- max to min by -step) {
         val randomIds = createRandomList(b * 100, vocabSize - 1)
         val partQ = lambdaQ(::, randomIds).toDenseMatrix
         val partBetaQ: BDM[Double] = partQ * 0.1 + 2.0
-        val partSumQ : BDV[Double] = sum(partBetaQ(breeze.linalg.*, ::))
+        val partSumQ: BDV[Double] = sum(partBetaQ(breeze.linalg.*, ::))
         // println(partSumQ.apply(1))
         startTime = System.nanoTime()
         lambdaQ(::, randomIds) := partQ + partBetaQ
@@ -107,21 +183,23 @@ object MatrixReadWrite extends App {
 
 
       val lambdaP = getGammaMatrixH(k, vocabSize)
-      val rowSumP : BDV[Double] = sum(lambdaP(breeze.linalg.*, ::)) // 1 * k <- k * v
+      val rowSumP: BDV[Double] = sum(lambdaP(breeze.linalg.*, ::)) // 1 * k <- k * v
 
       println("lambdaP old rowSum : " + rowSumP.apply(1))
 
-      val linkpartP = {max to min by -step}.map { case b =>
+      val linkpartP = {
+        max to min by -step
+      }.map { case b =>
         val randomIds = createRandomList(b * 100, vocabSize - 1)
         val partP = lambdaP(::, randomIds).toDenseMatrix
         val partBetaP: BDM[Double] = partP * 0.1 + 2.0
-        val partSumP : BDV[Double] = sum(partBetaP(breeze.linalg.*, ::))
+        val partSumP: BDV[Double] = sum(partBetaP(breeze.linalg.*, ::))
         (partP, partBetaP, randomIds)
       }
       println(linkpartP.apply(1)._3.length)
 
       startTime = System.nanoTime()
-      linkpartP.foreach{ case (partP, partBetaP, ids) =>
+      linkpartP.foreach { case (partP, partBetaP, ids) =>
         lambdaP(::, ids) := partP + partBetaP
       }
       endTime = System.nanoTime()
@@ -144,7 +222,7 @@ object MatrixReadWrite extends App {
 
       val lambdaP = getGammaMatrixH(k, vocabSize)
       startTime = System.nanoTime()
-      val rowSumP : BDV[Double] = sum(lambdaP(breeze.linalg.*, ::)) // 1 * k <- k * v
+      val rowSumP: BDV[Double] = sum(lambdaP(breeze.linalg.*, ::)) // 1 * k <- k * v
       // println("rowSumP: " + rowSumP.length)
       for (b <- max to min by -step) {
         val randomIds = createRandomList(b * 100, vocabSize - 1)
@@ -155,7 +233,7 @@ object MatrixReadWrite extends App {
 
       val lambdaQ = getGammaMatrixV(k, vocabSize)
       startTime = System.nanoTime()
-      val rowSumQ : BDV[Double] = sum(lambdaQ(breeze.linalg.*, ::)) // 1 * k <- k * v
+      val rowSumQ: BDV[Double] = sum(lambdaQ(breeze.linalg.*, ::)) // 1 * k <- k * v
       // println("rowSumQ: " + rowSumQ.length)
       for (b <- max to min by -step) {
         val randomIds = createRandomList(b * 100, vocabSize - 1)
