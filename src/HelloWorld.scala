@@ -11,13 +11,13 @@ import scala.concurrent.duration._
 
 
 object HelloWorld extends App {
-  println("hello whold!")
+  println("hello world!")
   //hyper parameters
-  val k = 20
+  val k = 200
   val vocabSize = 102660
   val eta = 1.0 / k
   val workersize = 16
-  val maxRecursive = 2.0
+  val maxRecursive = 9.0
   val seed = 0L
   val randomGenerator = new Random(seed)
   val alpha = BDV.fill[Double](k, 1.0 / k)
@@ -27,23 +27,24 @@ object HelloWorld extends App {
 
   val corpusSize = 8000
   val fileName = "datasets/nytimes_libsvm_8k.txt"
+  val tokenCount = 2320934
   // Step 1 : Original Process
-//  testSerialProcess(fileName)
-//  // Step 2 : Singel Thread Gouped
-//  testSingleThread(fileName, 1)
-//  testSingleThread(fileName, 4)
+  //  testSerialProcess(fileName)
+  //  // Step 2 : Singel Thread Gouped
+  //  testSingleThread(fileName, 1)
+  //  testSingleThread(fileName, 4)
   // Step 3 : Multi Threads
-//  testMultiThread(fileName, 4)
-//  testMultiThread(fileName, 16)
+  testMultiThread(fileName, 4)
+  //  testMultiThread(fileName, 16)
 
   def testSerialProcess(fileName: String): Unit = {
     val corpus = generateDocs(fileName)
     val LambdaQ = new BDM[Double](k, vocabSize, lambdaInit.toArray) // k * v
     val startTime = System.nanoTime()
     val finalResult = SerialProcess(LambdaQ, corpus)
-      // println("finalResult: " + sum(finalResult(1, ::)))
+    // println("finalResult: " + sum(finalResult(1, ::)))
     println("Serial Process Training Time: " + (1.0 * (System.nanoTime() - startTime) / 1e9).toString)
-    val perplexity = Perplexity(finalResult.t)
+    val perplexity = Perplexity(fileName, finalResult.t)
     println("-----------perplexity: " + perplexity.toString)
   }
 
@@ -54,19 +55,26 @@ object HelloWorld extends App {
     val finalResult = SingleThread(LambdaQ, corpus, threadNumber)
     // println("finalResult: " + sum(finalResult(1, ::)))
     println("SingleThread Training Time: " + (1.0 * (System.nanoTime() - startTime) / 1e9).toString)
-    val perplexity = Perplexity(finalResult.t)
+    val perplexity = Perplexity(fileName, finalResult.t)
     println("----------perplexity: " + perplexity.toString)
   }
 
   def testMultiThread(fileName: String, threadNumber: Int): Unit = {
     val corpus = generateDocs(fileName)
     val LambdaQ = new BDM[Double](k, vocabSize, lambdaInit.toArray) // k * v
-    val startTime = System.nanoTime()
+    var startTime = System.nanoTime()
     val finalResult = MultiThread(LambdaQ, corpus, threadNumber)
-    // println("finalResult: " + sum(finalResult(1, ::)))
     println("Multi Thread Training Time: " + (1.0 * (System.nanoTime() - startTime) / 1e9).toString)
-    val perplexity = Perplexity(finalResult.t)
+
+    startTime = System.nanoTime()
+    val perplexity = Perplexity(fileName, finalResult.t)
     println("----------perplexity: " + perplexity.toString)
+    println("Single Thread Testing Time: " + (1.0 * (System.nanoTime() - startTime) / 1e9).toString)
+
+    startTime = System.nanoTime()
+    val multiPerplexity = MultiPerplexity(fileName, finalResult.t, threadNumber)
+    println("----------perplexity: " + multiPerplexity.toString)
+    println("Multi Thread Testing Time: " + (1.0 * (System.nanoTime() - startTime) / 1e9).toString)
   }
 
   def SerialProcess(LambdaQ: BDM[Double], docs: Iterator[(Long, List[(Int, Double)])]): BDM[Double] = {
@@ -187,8 +195,8 @@ object HelloWorld extends App {
 
     val startT = System.nanoTime()
     var rowSumQ: BDV[Double] = sum(LambdaQ(breeze.linalg.*, ::)) // 1 * k <- k * v
-    println("rowSumQ[1]:" + rowSumQ.apply(1))
-    println("Sum Time:" + (System.nanoTime() - startT).toString)
+    //    println("rowSumQ[1]:" + rowSumQ.apply(1))
+    //    println("Sum Time:" + (System.nanoTime() - startT).toString)
     // println(sum(LambdaQ(1, ::)))
 
     val groupedIt = docs.grouped(threadNumber)
@@ -273,14 +281,13 @@ object HelloWorld extends App {
     (deltaRowSum, deltaLambdaQ)
   }
 
-  def Perplexity(lambdaD: BDM[Double]): Double = {
-    val fileName1 = "datasets/nytimes_libsvm_800.txt"
-    val docs = generateDocs(fileName1)
+  def Perplexity(fileName: String, lambdaD: BDM[Double]): Double = {
+    val docs = generateDocs(fileName)
     val ElogbetaD = dirichletExpectation(lambdaD.t).t
     val expElogbetaD = exp(ElogbetaD)
     var tokenCount: Double = 0.0
 
-    val corpusPart = docs.map { case (id: Long, termCounts: List[(Int, Double)]) =>
+    val corpusPart = docs.map { case (docId: Long, termCounts: List[(Int, Double)]) =>
       val len = termCounts.length
       val idsA = new Array[Int](len)
       val cts = new Array[Double](len)
@@ -292,9 +299,10 @@ object HelloWorld extends App {
         i += 1
       }
       val ids = idsA.toList
+
       var docBound = 0.0D
       val (gammad: BDV[Double], _, _) = lowPrecisionVI(
-        ids, cts, expElogbetaD, alpha, gammaShape, k, maxRecursive, seed + id)
+        ids, cts, expElogbetaD, alpha, gammaShape, k, maxRecursive, seed + docId)
       val Elogthetad: BDV[Double] = dirExpLowPrecision(gammad, maxRecursive)
       // E[log p(doc | theta, beta)]
       termCounts.foreach { case (idx, count) =>
@@ -308,15 +316,94 @@ object HelloWorld extends App {
       docBound += lgamma(sum(alpha)) - lgamma(sum(gammad))
       docBound
     }.sum
-    // println("corpusPart: " + corpusPart)
+    println("corpusPart: " + corpusPart)
 
     val sumEta = eta * vocabSize
     val topicsPart = sum((eta - lambdaD) *:* ElogbetaD) +
       sum(lgamma(lambdaD) - lgamma(eta)) +
       sum(lgamma(sumEta) - lgamma(sum(lambdaD(::, breeze.linalg.*))))
-    // println("topicsPart: " + topicsPart)
+    println("topicsPart: " + topicsPart)
     // println("tokenCount: " + tokenCount)
     val bound = topicsPart + corpusPart
+    exp(-bound / tokenCount)
+  }
+
+  def MultiPerplexity(fileName: String, lambdaD: BDM[Double], threadNumber: Int): Double = {
+    val docs = generateDocs(fileName)
+    val ElogbetaD = dirichletExpectation(lambdaD.t).t
+    val expElogbetaD = exp(ElogbetaD)
+
+//    val randBasis = new RandBasis(new org.apache.commons.math3.random.MersenneTwister(seed))
+//    val gammadInit: BDV[Double] =
+//      new Gamma(gammaShape, 1.0 / gammaShape)(randBasis).samplesVector(k) // K
+//    val expElogthetad: BDV[Double] = exp(dirExpLowPrecision(gammadInit, maxRecursive))
+
+    var corpusPart = 0.0D
+    val groupedIt = docs.grouped(threadNumber)
+    while (groupedIt.hasNext) {
+      val tasks: List[Future[Double]] =
+        for ((docId, termCounts: List[(Int, Double)]) <- groupedIt.next) yield Future {
+          var docBound = 0.0D
+
+//          val (gammad: BDV[Double], _, _) = fixInitLowPVI(termCounts,
+//            expElogbetaD, alpha, k, maxRecursive, gammadInit, expElogthetad)
+
+          val (ids, cts) = initDoc(termCounts)
+          val (gammad: BDV[Double], _, _) = lowPrecisionVI(
+            ids, cts, expElogbetaD, alpha, gammaShape, k, maxRecursive, seed + docId)
+
+          val Elogthetad: BDV[Double] = dirExpLowPrecision(gammad, maxRecursive)
+
+          // E[log p(doc | theta, beta)]
+          termCounts.foreach { case (idx, count) =>
+            docBound += count * logSumExp(Elogthetad + ElogbetaD(idx, ::).t)
+          }
+          // E[log p(theta | alpha) - log q(theta | gamma)]
+          docBound += sum((alpha - gammad) *:* Elogthetad)
+          docBound += sum(lgamma(gammad) - lgamma(alpha))
+          docBound += lgamma(sum(alpha)) - lgamma(sum(gammad))
+
+          docBound
+        }
+      val aggregated: Future[List[Double]] = Future.sequence(tasks)
+      val groupSeq: Seq[Double] = Await.result(aggregated, 3.seconds)
+      val groupPart: Double = groupSeq.sum
+
+//      val groupPart: Double = groupedIt.next.map { case (docId, termCounts: List[(Int, Double)]) =>
+////        val (gammad: BDV[Double], _, _) = fixInitLowPVI(termCounts,
+////          expElogbetaD, alpha, k, maxRecursive, gammadInit, expElogthetad)
+//        var docBound = 0.0D
+//
+//        val (ids, cts) = initDoc(termCounts)
+//        val (gammad: BDV[Double], _, _) = lowPrecisionVI(
+//          ids, cts, expElogbetaD, alpha, gammaShape, k, maxRecursive, seed + docId)
+//
+//        val Elogthetad: BDV[Double] = dirExpLowPrecision(gammad, maxRecursive)
+//
+//        // E[log p(doc | theta, beta)]
+//        termCounts.foreach { case (idx, count) =>
+//          docBound += count * logSumExp(Elogthetad + ElogbetaD(idx, ::).t)
+//        }
+//        // E[log p(theta | alpha) - log q(theta | gamma)]
+//        docBound += sum((alpha - gammad) *:* Elogthetad)
+//        docBound += sum(lgamma(gammad) - lgamma(alpha))
+//        docBound += lgamma(sum(alpha)) - lgamma(sum(gammad))
+//
+//        docBound
+//      }.sum
+      corpusPart += groupPart
+    }
+    println("corpusPart: " + corpusPart)
+
+    var startTime = System.nanoTime()
+    val sumEta = eta * vocabSize
+    val topicsPart = sum((eta - lambdaD) *:* ElogbetaD) +
+      sum(lgamma(lambdaD) - lgamma(eta)) +
+      sum(lgamma(sumEta) - lgamma(sum(lambdaD(::, breeze.linalg.*))))
+    val bound = topicsPart + corpusPart
+    println("calculateTopicsPart time: " + (System.nanoTime() - startTime).toString)
+    println("topicsPart: " + topicsPart)
+    // println("tokenCount: " + tokenCount)
     exp(-bound / tokenCount)
   }
 
@@ -390,6 +477,30 @@ object HelloWorld extends App {
     val ctsVector = new BDV[Double](cts) // ids
 
     // Iterate between gamma and phi until convergence
+    while (meanGammaChange > 1e-3) {
+      val lastgamma = gammad.copy
+      //        K                  K * ids               ids
+      gammad := (expElogthetad *:* (expElogbetad.t * (ctsVector /:/ phiNorm))) +:+ alpha
+      // expElogthetad := exp(LDAUtils.dirichletExpectation(gammad))
+      expElogthetad := exp(dirExpLowPrecision(gammad, maxRecursive))
+      // TODO: Keep more values in log space, and only exponentiate when needed.
+      phiNorm := expElogbetad * expElogthetad +:+ 1e-100
+      meanGammaChange = sum(abs(gammad - lastgamma)) / k
+    }
+    val sstatsd = expElogthetad.asDenseMatrix.t * (ctsVector /:/ phiNorm).asDenseMatrix
+    (gammad, sstatsd, ids)
+  }
+
+  def fixInitLowPVI(termCounts: List[(Int, Double)], expElogbeta: BDM[Double], alpha: breeze.linalg.Vector[Double], k: Int,
+                    maxRecursive: Double, gammad: BDV[Double], expElogthetad: BDV[Double]): (BDV[Double], BDM[Double], List[Int]) = {
+    val (ids: List[Int], cts: Array[Double]) = initDoc(termCounts)
+    val expElogbetad = expElogbeta(ids, ::).toDenseMatrix // ids * K
+
+    val phiNorm: BDV[Double] = expElogbetad * expElogthetad +:+ 1e-100 // ids
+    var meanGammaChange = 1D
+    val ctsVector = new BDV[Double](cts) // ids
+
+    // Iterate between gamma and phi until convergence
     while (meanGammaChange > 1e-2) {
       val lastgamma = gammad.copy
       //        K                  K * ids               ids
@@ -400,6 +511,7 @@ object HelloWorld extends App {
       phiNorm := expElogbetad * expElogthetad +:+ 1e-100
       meanGammaChange = sum(abs(gammad - lastgamma)) / k
     }
+
     val sstatsd = expElogthetad.asDenseMatrix.t * (ctsVector /:/ phiNorm).asDenseMatrix
     (gammad, sstatsd, ids)
   }
