@@ -1,4 +1,5 @@
 import java.util.Random
+import java.util.concurrent.locks.ReentrantReadWriteLock
 
 import breeze.linalg.{max, sum, DenseMatrix => BDM, DenseVector => BDV}
 import breeze.numerics._
@@ -7,8 +8,9 @@ import org.apache.commons.math3.util.FastMath
 
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.{Await, Future}
+import scala.concurrent.blocking
 import scala.concurrent.duration._
-
+import scala.concurrent.forkjoin._
 
 object HelloWorld extends App {
   println("hello world!")
@@ -51,6 +53,8 @@ object HelloWorld extends App {
 
     var rowSumQ: BDV[Double] = sum(LambdaQ(breeze.linalg.*, ::)) // 1 * k <- k * v
 
+    val lock = new ReentrantReadWriteLock()
+
     val groupedIt = docs.grouped(threadNumber)
     while (groupedIt.hasNext) {
       var startT = System.nanoTime()
@@ -67,13 +71,9 @@ object HelloWorld extends App {
           // Step 2 : calculate delta
           val (deltaRowSum, deltaLambdaQ) = calculateDelta(partQ, rowSum, a1factorial, a1factsum,
             ids, cts, iter, a1, a2, a3)
-
-          synchronized {
-            LambdaQ(::, ids) := LambdaQ(::, ids) + deltaLambdaQ // Sparse Write
-          }
-
           (ids, deltaLambdaQ, deltaRowSum)
         }
+      
       val aggregated: Future[Seq[(List[Int], BDM[Double], BDV[Double])]] = Future.sequence(tasks)
       val deltaSeq: Seq[(List[Int], BDM[Double], BDV[Double])] = Await.result(aggregated, 1.seconds)
       duration1 += (System.nanoTime() - startT)
@@ -258,10 +258,8 @@ object HelloWorld extends App {
 
     var a1factorial = 1.0
     var a1factsum = 0.0
-  //  val LambdaQ = new BDM[Double](k, vocabSize, lambdaInit.toArray) // k * v
+    // YY Todo: 可以按topic求和
     var rowSumQ: BDV[Double] = sum(LambdaQ(breeze.linalg.*, ::)) // 1 * k <- k * v
-    // println("rowSumQ[1]:" + rowSumQ.apply(1))
-    // println(sum(LambdaQ(1, ::)))
 
     docs.foreach { case (docId: Long, termCounts: List[(Int, Double)]) =>
       // YY Sparse Words
@@ -269,27 +267,28 @@ object HelloWorld extends App {
 
       val tmp1 = a3 * a1factsum
       // YY matrix read to get PartLambda  --- 2.5 ms
-      // YY Todo: Multi Thread
+      // YY Todo: PartQ可以按topic划分
       val PartQ = LambdaQ(::, ids).toDenseMatrix //  k * ids
-    val PartLambda: BDM[Double] = PartQ * a1factorial + tmp1 // k * ids
+      val PartLambda: BDM[Double] = PartQ * a1factorial + tmp1 // k * ids
 
       // YY get RowSum --- 0.0025 ms
       val tmp2 = tmp1 * vocabSize
+      // YY Todo: 可以按topic还原
       val rowSum = rowSumQ * a1factorial + tmp2 // k
 
-      // YY Todo: Multi Thread
+      // YY Todo: 把两部分输入都划分的情况下，可以按topic计算
       val PartExpElogBetaD = exp(dirExpLowPrecision(PartLambda,
         rowSum, maxRecursive)).t.toDenseMatrix // ids * k
 
       // E-Step
       // YY Local VI with sparse expElogbeta, sstats(k * ids) --- 5.3 ms
-      // YY Todo: Multi Thread
+      // YY Todo: 返回的结果，可以按topic存储
       val (gammad, sstats) = partLowPVI(PartExpElogBetaD, alpha, gammaShape, k,
         maxRecursive, seed + index, iter, ids, cts)
 
       // YY real delta -> lazy update delta  --- 0.37 ms
       val tmp3 = a2 / (a1factorial * a1)
-      // YY Todo: Multi Thread
+      // YY Todo: 两部分矩阵都是划分存储的情况下，可以按topic计算
       val DeltaLambdaQ = (sstats * tmp3) *:* PartExpElogBetaD.t // k * ids
       // YY prepare for next lambdaQ --- 1.65 ms
       PartQ := PartQ + DeltaLambdaQ // k * ids
@@ -477,12 +476,15 @@ object HelloWorld extends App {
                  maxRecursive: Double, seed: Long, iter: Int, ids: List[Int], cts: Array[Double]): (BDV[Double], BDM[Double]) = {
     // Initialize the variational distribution q(theta|gamma) for the mini-batch
     val randBasis = new RandBasis(new org.apache.commons.math3.random.MersenneTwister(seed))
+    // YY Todo: gammad 的k维之间是否需要满足某些依赖 or 约束 ？？ 可能需要masterThread实现
     val gammad: BDV[Double] =
       new Gamma(gammaShape, 1.0 / gammaShape)(randBasis).samplesVector(k) // K
+    // YY Todo: 需要对 gammad 求 sum，可能需要masterThread实现
     val expElogthetad: BDV[Double] = exp(dirExpLowPrecision(gammad, maxRecursive)) // K
     // YY ignored the original version
     // val expElogbetad = expElogbeta(ids, ::).toDenseMatrix                        // ids * K
 
+    // YY Todo: 1.需要划分thetad，2.分别求出ids长度的向量后需要加和，不是连接
     val phiNorm: BDV[Double] = expElogbetad * expElogthetad +:+ 1e-100 // ids
     var meanGammaChange = 1D
     val ctsVector = new BDV[Double](cts) // ids
@@ -490,10 +492,12 @@ object HelloWorld extends App {
     // Iterate between gamma and phi until convergence
     while (meanGammaChange > 1e-2) {
       val lastgamma = gammad.copy
+      // YY Todo:前半部分可以让masterThread做，后半部分可以按topic分开进行（共享cts和phiNorm的前提下）再连接
       //        K                  K * ids               ids
       gammad := (expElogthetad *:* (expElogbetad.t * (ctsVector /:/ phiNorm))) +:+ alpha
+      // YY Todo: 需要对 gammad 求 sum，可能需要masterThread实现
       expElogthetad := exp(dirExpLowPrecision(gammad, maxRecursive))
-      // TODO: Keep more values in log space, and only exponentiate when needed.
+      // YY Todo: 1.需要共享thetad才能计算，2.分别求出ids长度的向量后需要加和，可以让masterThread做
       phiNorm := expElogbetad * expElogthetad +:+ 1e-100
       meanGammaChange = sum(abs(gammad - lastgamma)) / k
     }
@@ -568,6 +572,7 @@ object HelloWorld extends App {
   def dirExpLowPrecision(alpha: BDM[Double], rowSum: BDV[Double], maxRecursive: Double): BDM[Double] = {
     val digAlpha = alpha.map(x => digammaLowPrecision(x, maxRecursive))
     val digRowSum = rowSum.map(x => digammaLowPrecision(x, maxRecursive))
+    // YY Todo: 可以按行做减法
     val result = digAlpha(::, breeze.linalg.*) - digRowSum
     result // k * v
   }
