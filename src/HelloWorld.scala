@@ -37,6 +37,113 @@ object HelloWorld extends App {
   testMultiThread(fileName, 4)
   //  testMultiThread(fileName, 16)
 
+  def MultiThread(LambdaQ: BDM[Double], docs: Iterator[(Long, List[(Int, Double)])], threadNumber: Int): BDM[Double] = {
+    val iter = 1
+    val weight = math.pow((4096 + iter) * workersize, -0.6)
+    val a1 = 1.0 - weight
+    val a2 = weight * corpusSize
+    val a3 = weight * eta
+
+    var a1factorial = 1.0
+    var a1factsum = 0.0
+
+    val startT = System.nanoTime()
+    var rowSumQ: BDV[Double] = sum(LambdaQ(breeze.linalg.*, ::)) // 1 * k <- k * v
+    //    println("rowSumQ[1]:" + rowSumQ.apply(1))
+    //    println("Sum Time:" + (System.nanoTime() - startT).toString)
+    // println(sum(LambdaQ(1, ::)))
+
+    val groupedIt = docs.grouped(threadNumber)
+    while (groupedIt.hasNext) {
+      val partSeq = groupedIt.next.map { case (docId: Long, termCounts: List[(Int, Double)]) =>
+        val (ids, cts) = initDoc(termCounts)
+        // Step 1 : read shared parameters
+        val partQ = LambdaQ(::, ids).toDenseMatrix //  k * ids
+        (ids, cts, partQ)
+      }
+
+      val rowSum = rowSumQ * a1factorial + a3 * a1factsum * vocabSize // k
+
+      // customize the execution context to use the specified number of threads
+      val tasks: List[Future[(List[Int], BDM[Double], BDV[Double])]] =
+        for ((ids, cts, partQ) <- partSeq) yield Future {
+          // Step 2 : calculate delta
+          val (deltaRowSum, deltaLambdaQ) = calculateDelta(partQ, rowSum, a1factorial, a1factsum,
+            ids, cts, iter, a1, a2, a3)
+          (ids, deltaLambdaQ, deltaRowSum)
+        }
+      val aggregated: Future[Seq[(List[Int], BDM[Double], BDV[Double])]] = Future.sequence(tasks)
+      val deltaSeq: Seq[(List[Int], BDM[Double], BDV[Double])] = Await.result(aggregated, 1.seconds)
+
+      // Step 3 : write shared parameters
+      deltaSeq.foreach { case (ids, deltaLambdaQ, deltaRowSum) =>
+        LambdaQ(::, ids) := LambdaQ(::, ids) + deltaLambdaQ // Sparse Write
+        rowSumQ := rowSumQ + deltaRowSum
+        a1factsum = a1factsum + a1factorial
+        a1factorial = a1factorial * a1
+      }
+    }
+    // YY reconstract real Matrix value --- 246 ms
+    val tmp4 = a3 * a1factsum
+    LambdaQ := LambdaQ * a1factorial + tmp4 // k * v
+    LambdaQ
+  }
+
+  def testMultiThread(fileName: String, threadNumber: Int): Unit = {
+    val corpus = generateDocs(fileName)
+    val LambdaQ = new BDM[Double](k, vocabSize, lambdaInit.toArray) // k * v
+    var startTime = System.nanoTime()
+    val finalResult = MultiThread(LambdaQ, corpus, threadNumber)
+    println("Multi Thread Training Time: " + (1.0 * (System.nanoTime() - startTime) / 1e9).toString)
+
+    val multiPerplexity = MultiPerplexity(fileName, finalResult.t, threadNumber)
+    println("----------multi test perplexity: " + multiPerplexity.toString)
+  }
+
+  def MultiPerplexity(fileName: String, lambdaD: BDM[Double], threadNumber: Int): Double = {
+    val docs = generateDocs(fileName)
+    val ElogbetaD = dirichletExpectation(lambdaD.t).t
+    val expElogbetaD = exp(ElogbetaD)
+
+    var corpusPart = 0.0D
+    val groupedIt = docs.grouped(threadNumber)
+    while (groupedIt.hasNext) {
+      val tasks: List[Future[Double]] =
+        for ((docId, termCounts: List[(Int, Double)]) <- groupedIt.next) yield Future {
+          var docBound = 0.0D
+          val (ids, cts) = initDoc(termCounts)
+          val (gammad: BDV[Double], _, _) = lowPrecisionVI(
+            ids, cts, expElogbetaD, alpha, gammaShape, k, maxRecursive, seed + docId)
+
+          val Elogthetad: BDV[Double] = dirExpLowPrecision(gammad, maxRecursive)
+
+          // E[log p(doc | theta, beta)]
+          termCounts.foreach { case (idx, count) =>
+            docBound += count * logSumExp(Elogthetad + ElogbetaD(idx, ::).t)
+          }
+          // E[log p(theta | alpha) - log q(theta | gamma)]
+          docBound += sum((alpha - gammad) *:* Elogthetad)
+          docBound += sum(lgamma(gammad) - lgamma(alpha))
+          docBound += lgamma(sum(alpha)) - lgamma(sum(gammad))
+
+          docBound
+        }
+      val aggregated: Future[List[Double]] = Future.sequence(tasks)
+      val groupSeq: Seq[Double] = Await.result(aggregated, 3.seconds)
+      val groupPart: Double = groupSeq.sum
+      corpusPart += groupPart
+    }
+    println("corpusPart: " + corpusPart)
+
+    var startTime = System.nanoTime()
+    val sumEta = eta * vocabSize
+    val topicsPart = sum((eta - lambdaD) *:* ElogbetaD) +
+      sum(lgamma(lambdaD) - lgamma(eta)) +
+      sum(lgamma(sumEta) - lgamma(sum(lambdaD(::, breeze.linalg.*))))
+    val bound = topicsPart + corpusPart
+    exp(-bound / tokenCount)
+  }
+
   def testSerialProcess(fileName: String): Unit = {
     val corpus = generateDocs(fileName)
     val LambdaQ = new BDM[Double](k, vocabSize, lambdaInit.toArray) // k * v
@@ -57,24 +164,6 @@ object HelloWorld extends App {
     println("SingleThread Training Time: " + (1.0 * (System.nanoTime() - startTime) / 1e9).toString)
     val perplexity = Perplexity(fileName, finalResult.t)
     println("----------perplexity: " + perplexity.toString)
-  }
-
-  def testMultiThread(fileName: String, threadNumber: Int): Unit = {
-    val corpus = generateDocs(fileName)
-    val LambdaQ = new BDM[Double](k, vocabSize, lambdaInit.toArray) // k * v
-    var startTime = System.nanoTime()
-    val finalResult = MultiThread(LambdaQ, corpus, threadNumber)
-    println("Multi Thread Training Time: " + (1.0 * (System.nanoTime() - startTime) / 1e9).toString)
-
-    startTime = System.nanoTime()
-    val perplexity = Perplexity(fileName, finalResult.t)
-    println("----------perplexity: " + perplexity.toString)
-    println("Single Thread Testing Time: " + (1.0 * (System.nanoTime() - startTime) / 1e9).toString)
-
-    startTime = System.nanoTime()
-    val multiPerplexity = MultiPerplexity(fileName, finalResult.t, threadNumber)
-    println("----------perplexity: " + multiPerplexity.toString)
-    println("Multi Thread Testing Time: " + (1.0 * (System.nanoTime() - startTime) / 1e9).toString)
   }
 
   def SerialProcess(LambdaQ: BDM[Double], docs: Iterator[(Long, List[(Int, Double)])]): BDM[Double] = {
@@ -183,58 +272,6 @@ object HelloWorld extends App {
     LambdaQ
   }
 
-  def MultiThread(LambdaQ: BDM[Double], docs: Iterator[(Long, List[(Int, Double)])], threadNumber: Int): BDM[Double] = {
-    val iter = 1
-    val weight = math.pow((4096 + iter) * workersize, -0.6)
-    val a1 = 1.0 - weight
-    val a2 = weight * corpusSize
-    val a3 = weight * eta
-
-    var a1factorial = 1.0
-    var a1factsum = 0.0
-
-    val startT = System.nanoTime()
-    var rowSumQ: BDV[Double] = sum(LambdaQ(breeze.linalg.*, ::)) // 1 * k <- k * v
-    //    println("rowSumQ[1]:" + rowSumQ.apply(1))
-    //    println("Sum Time:" + (System.nanoTime() - startT).toString)
-    // println(sum(LambdaQ(1, ::)))
-
-    val groupedIt = docs.grouped(threadNumber)
-    while (groupedIt.hasNext) {
-      val partSeq = groupedIt.next.map { case (docId: Long, termCounts: List[(Int, Double)]) =>
-        val (ids, cts) = initDoc(termCounts)
-        // Step 1 : read shared parameters
-        val partQ = LambdaQ(::, ids).toDenseMatrix //  k * ids
-        (ids, cts, partQ)
-      }
-
-      val rowSum = rowSumQ * a1factorial + a3 * a1factsum * vocabSize // k
-
-      // customize the execution context to use the specified number of threads
-      val tasks: List[Future[(List[Int], BDM[Double], BDV[Double])]] =
-        for ((ids, cts, partQ) <- partSeq) yield Future {
-          // Step 2 : calculate delta
-          val (deltaRowSum, deltaLambdaQ) = calculateDelta(partQ, rowSum, a1factorial, a1factsum,
-            ids, cts, iter, a1, a2, a3)
-          (ids, deltaLambdaQ, deltaRowSum)
-        }
-      val aggregated: Future[Seq[(List[Int], BDM[Double], BDV[Double])]] = Future.sequence(tasks)
-      val deltaSeq: Seq[(List[Int], BDM[Double], BDV[Double])] = Await.result(aggregated, 1.seconds)
-
-      // Step 3 : write shared parameters
-      deltaSeq.foreach { case (ids, deltaLambdaQ, deltaRowSum) =>
-        LambdaQ(::, ids) := LambdaQ(::, ids) + deltaLambdaQ // Sparse Write
-        rowSumQ := rowSumQ + deltaRowSum
-        a1factsum = a1factsum + a1factorial
-        a1factorial = a1factorial * a1
-      }
-    }
-    // YY reconstract real Matrix value --- 246 ms
-    val tmp4 = a3 * a1factsum
-    LambdaQ := LambdaQ * a1factorial + tmp4 // k * v
-    LambdaQ
-  }
-
   def generateDocs(fileName: String): Iterator[(Long, List[(Int, Double)])] = {
     // val fileName = "datasets/nytimes_libsvm_800.txt"
 
@@ -328,85 +365,6 @@ object HelloWorld extends App {
     exp(-bound / tokenCount)
   }
 
-  def MultiPerplexity(fileName: String, lambdaD: BDM[Double], threadNumber: Int): Double = {
-    val docs = generateDocs(fileName)
-    val ElogbetaD = dirichletExpectation(lambdaD.t).t
-    val expElogbetaD = exp(ElogbetaD)
-
-//    val randBasis = new RandBasis(new org.apache.commons.math3.random.MersenneTwister(seed))
-//    val gammadInit: BDV[Double] =
-//      new Gamma(gammaShape, 1.0 / gammaShape)(randBasis).samplesVector(k) // K
-//    val expElogthetad: BDV[Double] = exp(dirExpLowPrecision(gammadInit, maxRecursive))
-
-    var corpusPart = 0.0D
-    val groupedIt = docs.grouped(threadNumber)
-    while (groupedIt.hasNext) {
-      val tasks: List[Future[Double]] =
-        for ((docId, termCounts: List[(Int, Double)]) <- groupedIt.next) yield Future {
-          var docBound = 0.0D
-
-//          val (gammad: BDV[Double], _, _) = fixInitLowPVI(termCounts,
-//            expElogbetaD, alpha, k, maxRecursive, gammadInit, expElogthetad)
-
-          val (ids, cts) = initDoc(termCounts)
-          val (gammad: BDV[Double], _, _) = lowPrecisionVI(
-            ids, cts, expElogbetaD, alpha, gammaShape, k, maxRecursive, seed + docId)
-
-          val Elogthetad: BDV[Double] = dirExpLowPrecision(gammad, maxRecursive)
-
-          // E[log p(doc | theta, beta)]
-          termCounts.foreach { case (idx, count) =>
-            docBound += count * logSumExp(Elogthetad + ElogbetaD(idx, ::).t)
-          }
-          // E[log p(theta | alpha) - log q(theta | gamma)]
-          docBound += sum((alpha - gammad) *:* Elogthetad)
-          docBound += sum(lgamma(gammad) - lgamma(alpha))
-          docBound += lgamma(sum(alpha)) - lgamma(sum(gammad))
-
-          docBound
-        }
-      val aggregated: Future[List[Double]] = Future.sequence(tasks)
-      val groupSeq: Seq[Double] = Await.result(aggregated, 3.seconds)
-      val groupPart: Double = groupSeq.sum
-
-//      val groupPart: Double = groupedIt.next.map { case (docId, termCounts: List[(Int, Double)]) =>
-////        val (gammad: BDV[Double], _, _) = fixInitLowPVI(termCounts,
-////          expElogbetaD, alpha, k, maxRecursive, gammadInit, expElogthetad)
-//        var docBound = 0.0D
-//
-//        val (ids, cts) = initDoc(termCounts)
-//        val (gammad: BDV[Double], _, _) = lowPrecisionVI(
-//          ids, cts, expElogbetaD, alpha, gammaShape, k, maxRecursive, seed + docId)
-//
-//        val Elogthetad: BDV[Double] = dirExpLowPrecision(gammad, maxRecursive)
-//
-//        // E[log p(doc | theta, beta)]
-//        termCounts.foreach { case (idx, count) =>
-//          docBound += count * logSumExp(Elogthetad + ElogbetaD(idx, ::).t)
-//        }
-//        // E[log p(theta | alpha) - log q(theta | gamma)]
-//        docBound += sum((alpha - gammad) *:* Elogthetad)
-//        docBound += sum(lgamma(gammad) - lgamma(alpha))
-//        docBound += lgamma(sum(alpha)) - lgamma(sum(gammad))
-//
-//        docBound
-//      }.sum
-      corpusPart += groupPart
-    }
-    println("corpusPart: " + corpusPart)
-
-    var startTime = System.nanoTime()
-    val sumEta = eta * vocabSize
-    val topicsPart = sum((eta - lambdaD) *:* ElogbetaD) +
-      sum(lgamma(lambdaD) - lgamma(eta)) +
-      sum(lgamma(sumEta) - lgamma(sum(lambdaD(::, breeze.linalg.*))))
-    val bound = topicsPart + corpusPart
-    println("calculateTopicsPart time: " + (System.nanoTime() - startTime).toString)
-    println("topicsPart: " + topicsPart)
-    // println("tokenCount: " + tokenCount)
-    exp(-bound / tokenCount)
-  }
-
   def getGammaMatrix(row: Int, col: Int): BDM[Double] = {
     val randBasis = new RandBasis(new org.apache.commons.math3.random.MersenneTwister(
       randomGenerator.nextLong()))
@@ -487,31 +445,6 @@ object HelloWorld extends App {
       phiNorm := expElogbetad * expElogthetad +:+ 1e-100
       meanGammaChange = sum(abs(gammad - lastgamma)) / k
     }
-    val sstatsd = expElogthetad.asDenseMatrix.t * (ctsVector /:/ phiNorm).asDenseMatrix
-    (gammad, sstatsd, ids)
-  }
-
-  def fixInitLowPVI(termCounts: List[(Int, Double)], expElogbeta: BDM[Double], alpha: breeze.linalg.Vector[Double], k: Int,
-                    maxRecursive: Double, gammad: BDV[Double], expElogthetad: BDV[Double]): (BDV[Double], BDM[Double], List[Int]) = {
-    val (ids: List[Int], cts: Array[Double]) = initDoc(termCounts)
-    val expElogbetad = expElogbeta(ids, ::).toDenseMatrix // ids * K
-
-    val phiNorm: BDV[Double] = expElogbetad * expElogthetad +:+ 1e-100 // ids
-    var meanGammaChange = 1D
-    val ctsVector = new BDV[Double](cts) // ids
-
-    // Iterate between gamma and phi until convergence
-    while (meanGammaChange > 1e-2) {
-      val lastgamma = gammad.copy
-      //        K                  K * ids               ids
-      gammad := (expElogthetad *:* (expElogbetad.t * (ctsVector /:/ phiNorm))) +:+ alpha
-      // expElogthetad := exp(LDAUtils.dirichletExpectation(gammad))
-      expElogthetad := exp(dirExpLowPrecision(gammad, maxRecursive))
-      // TODO: Keep more values in log space, and only exponentiate when needed.
-      phiNorm := expElogbetad * expElogthetad +:+ 1e-100
-      meanGammaChange = sum(abs(gammad - lastgamma)) / k
-    }
-
     val sstatsd = expElogthetad.asDenseMatrix.t * (ctsVector /:/ phiNorm).asDenseMatrix
     (gammad, sstatsd, ids)
   }
