@@ -29,13 +29,11 @@ object HelloWorld extends App {
   val fileName = "datasets/nytimes_libsvm_8k.txt"
   val tokenCount = 2320934
   // Step 1 : Original Process
-  testSerialProcess(fileName)
+  // testSerialProcess(fileName)
   //  // Step 2 : Singel Thread Gouped
   //  testSingleThread(fileName, 1)
   //  testSingleThread(fileName, 4)
   // Step 3 : Multi Threads
-  testMultiThread(fileName, 1)
-  testMultiThread(fileName, 2)
   testMultiThread(fileName, 4)
 
   def AdvancedMultiThread(LambdaQ: BDM[Double], docs: Iterator[(Long, List[(Int, Double)])], threadNumber: Int): BDM[Double] = {
@@ -69,6 +67,11 @@ object HelloWorld extends App {
           // Step 2 : calculate delta
           val (deltaRowSum, deltaLambdaQ) = calculateDelta(partQ, rowSum, a1factorial, a1factsum,
             ids, cts, iter, a1, a2, a3)
+
+          synchronized {
+            LambdaQ(::, ids) := LambdaQ(::, ids) + deltaLambdaQ // Sparse Write
+          }
+
           (ids, deltaLambdaQ, deltaRowSum)
         }
       val aggregated: Future[Seq[(List[Int], BDM[Double], BDV[Double])]] = Future.sequence(tasks)
@@ -77,7 +80,6 @@ object HelloWorld extends App {
       startT = System.nanoTime()
       // Step 3 : write shared parameters
       deltaSeq.foreach { case (ids, deltaLambdaQ, deltaRowSum) =>
-        LambdaQ(::, ids) := LambdaQ(::, ids) + deltaLambdaQ // Sparse Write
         rowSumQ := rowSumQ + deltaRowSum
         a1factsum = a1factsum + a1factorial
         a1factorial = a1factorial * a1
@@ -156,19 +158,19 @@ object HelloWorld extends App {
   }
 
   def testMultiThread(fileName: String, threadNumber: Int): Unit = {
-    val corpus = generateDocs(fileName)
-    val LambdaQ = new BDM[Double](k, vocabSize, lambdaInit.toArray) // k * v
-
-    println("=========Basic multi thread with " + threadNumber.toString + " threads======")
+//    val corpus = generateDocs(fileName)
+//    val LambdaQ = new BDM[Double](k, vocabSize, lambdaInit.toArray) // k * v
+//
+//    println("=========Basic multi thread with " + threadNumber.toString + " threads======")
     var startTime = System.nanoTime()
-    val finalResult = MultiThread(LambdaQ, corpus, threadNumber)
-    println("Multi Thread Training Time: " + (1.0 * (System.nanoTime() - startTime) / 1e9).toString)
-
-    val multiPerplexity = MultiPerplexity(fileName, finalResult.t, threadNumber)
-    println("----------multi test perplexity: " + multiPerplexity.toString)
+//    val finalResult = MultiThread(LambdaQ, corpus, threadNumber)
+//    println("Multi Thread Training Time: " + (1.0 * (System.nanoTime() - startTime) / 1e9).toString)
+//
+//    val multiPerplexity = MultiPerplexity(fileName, finalResult.t, threadNumber)
+//    println("----------multi test perplexity: " + multiPerplexity.toString)
 
     val corpus2 = generateDocs(fileName)
-    val LambdaQ2 = new BDM[Double](k, vocabSize, lambdaInit.toArray) // k * v
+    var LambdaQ2 = new BDM[Double](k, vocabSize, lambdaInit.toArray) // k * v
 
     println("=========Advanced multi thread with " + threadNumber.toString + " threads======")
     startTime = System.nanoTime()
@@ -227,12 +229,13 @@ object HelloWorld extends App {
     val corpus = generateDocs(fileName)
     val LambdaQ = new BDM[Double](k, vocabSize, lambdaInit.toArray) // k * v
     println("===========Serial Process=========")
-    val startTime = System.nanoTime()
+    var startTime = System.nanoTime()
     val finalResult = SerialProcess(LambdaQ, corpus)
-    // println("finalResult: " + sum(finalResult(1, ::)))
     println("Serial Process Training Time: " + (1.0 * (System.nanoTime() - startTime) / 1e9).toString)
+    startTime = System.nanoTime()
     val perplexity = Perplexity(fileName, finalResult.t)
     println("-----------perplexity: " + perplexity.toString)
+    println("Serial perplexity test time: " + (1.0 * (System.nanoTime() - startTime) / 1e9).toString)
   }
 
   def testSingleThread(fileName: String, threadNumber: Int): Unit = {
