@@ -13,7 +13,7 @@ import scala.concurrent.duration._
 object HelloWorld extends App {
   println("hello world!")
   //hyper parameters
-  val k = 200
+  val k = 100
   val vocabSize = 102660
   val eta = 1.0 / k
   val workersize = 16
@@ -29,13 +29,69 @@ object HelloWorld extends App {
   val fileName = "datasets/nytimes_libsvm_8k.txt"
   val tokenCount = 2320934
   // Step 1 : Original Process
-  //  testSerialProcess(fileName)
+  testSerialProcess(fileName)
   //  // Step 2 : Singel Thread Gouped
   //  testSingleThread(fileName, 1)
   //  testSingleThread(fileName, 4)
   // Step 3 : Multi Threads
+  testMultiThread(fileName, 1)
+  testMultiThread(fileName, 2)
   testMultiThread(fileName, 4)
-  //  testMultiThread(fileName, 16)
+
+  def AdvancedMultiThread(LambdaQ: BDM[Double], docs: Iterator[(Long, List[(Int, Double)])], threadNumber: Int): BDM[Double] = {
+    val iter = 1
+    val weight = math.pow((4096 + iter) * workersize, -0.6)
+    val a1 = 1.0 - weight
+    val a2 = weight * corpusSize
+    val a3 = weight * eta
+
+    var a1factorial = 1.0
+    var a1factsum = 0.0
+
+    var duration1 = 0L
+    var duration2 = 0L
+
+    var rowSumQ: BDV[Double] = sum(LambdaQ(breeze.linalg.*, ::)) // 1 * k <- k * v
+
+    val groupedIt = docs.grouped(threadNumber)
+    while (groupedIt.hasNext) {
+      var startT = System.nanoTime()
+
+      val rowSum = BDV.zeros[Double](k)
+      rowSum := rowSumQ * a1factorial + a3 * a1factsum * vocabSize // k
+      // customize the execution context to use the specified number of threads
+      val tasks: List[Future[(List[Int], BDM[Double], BDV[Double])]] =
+        for ((docId, termCounts) <- groupedIt.next) yield Future {
+          val (ids, cts) = initDoc(termCounts)
+          // Step 1 : read shared parameters
+          val partQ = BDM.zeros[Double](k, ids.length)
+          partQ := LambdaQ(::, ids).toDenseMatrix //  k * ids
+          // Step 2 : calculate delta
+          val (deltaRowSum, deltaLambdaQ) = calculateDelta(partQ, rowSum, a1factorial, a1factsum,
+            ids, cts, iter, a1, a2, a3)
+          (ids, deltaLambdaQ, deltaRowSum)
+        }
+      val aggregated: Future[Seq[(List[Int], BDM[Double], BDV[Double])]] = Future.sequence(tasks)
+      val deltaSeq: Seq[(List[Int], BDM[Double], BDV[Double])] = Await.result(aggregated, 1.seconds)
+      duration1 += (System.nanoTime() - startT)
+      startT = System.nanoTime()
+      // Step 3 : write shared parameters
+      deltaSeq.foreach { case (ids, deltaLambdaQ, deltaRowSum) =>
+        LambdaQ(::, ids) := LambdaQ(::, ids) + deltaLambdaQ // Sparse Write
+        rowSumQ := rowSumQ + deltaRowSum
+        a1factsum = a1factsum + a1factorial
+        a1factorial = a1factorial * a1
+      }
+      duration2 += (System.nanoTime() - startT)
+    }
+    println("Future time: " + (1.0 * duration1 / 1e9).toString)
+    println("Writing time: " + (1.0 * duration2 / 1e9).toString)
+
+    // YY reconstract real Matrix value --- 246 ms
+    val tmp4 = a3 * a1factsum
+    LambdaQ := LambdaQ * a1factorial + tmp4 // k * v
+    LambdaQ
+  }
 
   def MultiThread(LambdaQ: BDM[Double], docs: Iterator[(Long, List[(Int, Double)])], threadNumber: Int): BDM[Double] = {
     val iter = 1
@@ -47,23 +103,25 @@ object HelloWorld extends App {
     var a1factorial = 1.0
     var a1factsum = 0.0
 
-    val startT = System.nanoTime()
+    var duration0 = 0L
+    var duration1 = 0L
+    var duration2 = 0L
+
     var rowSumQ: BDV[Double] = sum(LambdaQ(breeze.linalg.*, ::)) // 1 * k <- k * v
-    //    println("rowSumQ[1]:" + rowSumQ.apply(1))
-    //    println("Sum Time:" + (System.nanoTime() - startT).toString)
-    // println(sum(LambdaQ(1, ::)))
 
     val groupedIt = docs.grouped(threadNumber)
     while (groupedIt.hasNext) {
+      var startT = System.nanoTime()
       val partSeq = groupedIt.next.map { case (docId: Long, termCounts: List[(Int, Double)]) =>
         val (ids, cts) = initDoc(termCounts)
         // Step 1 : read shared parameters
         val partQ = LambdaQ(::, ids).toDenseMatrix //  k * ids
         (ids, cts, partQ)
       }
-
       val rowSum = rowSumQ * a1factorial + a3 * a1factsum * vocabSize // k
+      duration0 += (System.nanoTime() - startT)
 
+      startT = System.nanoTime()
       // customize the execution context to use the specified number of threads
       val tasks: List[Future[(List[Int], BDM[Double], BDV[Double])]] =
         for ((ids, cts, partQ) <- partSeq) yield Future {
@@ -74,7 +132,9 @@ object HelloWorld extends App {
         }
       val aggregated: Future[Seq[(List[Int], BDM[Double], BDV[Double])]] = Future.sequence(tasks)
       val deltaSeq: Seq[(List[Int], BDM[Double], BDV[Double])] = Await.result(aggregated, 1.seconds)
+      duration1 += (System.nanoTime() - startT)
 
+      startT = System.nanoTime()
       // Step 3 : write shared parameters
       deltaSeq.foreach { case (ids, deltaLambdaQ, deltaRowSum) =>
         LambdaQ(::, ids) := LambdaQ(::, ids) + deltaLambdaQ // Sparse Write
@@ -82,7 +142,13 @@ object HelloWorld extends App {
         a1factsum = a1factsum + a1factorial
         a1factorial = a1factorial * a1
       }
+      duration2 += (System.nanoTime() - startT)
     }
+
+    println("Read time: " + (1.0 * duration0 / 1e9).toString)
+    println("Future time: " + (1.0 * duration1 / 1e9).toString)
+    println("Writing time: " + (1.0 * duration2 / 1e9).toString)
+
     // YY reconstract real Matrix value --- 246 ms
     val tmp4 = a3 * a1factsum
     LambdaQ := LambdaQ * a1factorial + tmp4 // k * v
@@ -92,12 +158,25 @@ object HelloWorld extends App {
   def testMultiThread(fileName: String, threadNumber: Int): Unit = {
     val corpus = generateDocs(fileName)
     val LambdaQ = new BDM[Double](k, vocabSize, lambdaInit.toArray) // k * v
+
+    println("=========Basic multi thread with " + threadNumber.toString + " threads======")
     var startTime = System.nanoTime()
     val finalResult = MultiThread(LambdaQ, corpus, threadNumber)
     println("Multi Thread Training Time: " + (1.0 * (System.nanoTime() - startTime) / 1e9).toString)
 
     val multiPerplexity = MultiPerplexity(fileName, finalResult.t, threadNumber)
     println("----------multi test perplexity: " + multiPerplexity.toString)
+
+    val corpus2 = generateDocs(fileName)
+    val LambdaQ2 = new BDM[Double](k, vocabSize, lambdaInit.toArray) // k * v
+
+    println("=========Advanced multi thread with " + threadNumber.toString + " threads======")
+    startTime = System.nanoTime()
+    val finalResult2 = AdvancedMultiThread(LambdaQ2, corpus2, threadNumber)
+    println("Advanced Multi Thread Training Time: " + (1.0 * (System.nanoTime() - startTime) / 1e9).toString)
+
+    val multiPerplexity2 = MultiPerplexity(fileName, finalResult2.t, threadNumber)
+    println("----------multi test perplexity: " + multiPerplexity2.toString)
   }
 
   def MultiPerplexity(fileName: String, lambdaD: BDM[Double], threadNumber: Int): Double = {
@@ -147,6 +226,7 @@ object HelloWorld extends App {
   def testSerialProcess(fileName: String): Unit = {
     val corpus = generateDocs(fileName)
     val LambdaQ = new BDM[Double](k, vocabSize, lambdaInit.toArray) // k * v
+    println("===========Serial Process=========")
     val startTime = System.nanoTime()
     val finalResult = SerialProcess(LambdaQ, corpus)
     // println("finalResult: " + sum(finalResult(1, ::)))
@@ -175,7 +255,7 @@ object HelloWorld extends App {
 
     var a1factorial = 1.0
     var a1factsum = 0.0
-    val LambdaQ = new BDM[Double](k, vocabSize, lambdaInit.toArray) // k * v
+  //  val LambdaQ = new BDM[Double](k, vocabSize, lambdaInit.toArray) // k * v
     var rowSumQ: BDV[Double] = sum(LambdaQ(breeze.linalg.*, ::)) // 1 * k <- k * v
     // println("rowSumQ[1]:" + rowSumQ.apply(1))
     // println(sum(LambdaQ(1, ::)))
